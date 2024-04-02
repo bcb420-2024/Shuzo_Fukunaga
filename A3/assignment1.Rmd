@@ -1,0 +1,318 @@
+---
+title: "BCB420 Assignment1"
+author: "Shuzo Fukunaga"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+bibliography: assignment1.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+In late 2019, a novel coronavirus, severe acute respiratory synfrome coronavirus 2 (SARS-CoV-2), which cause a severe respiratory disease, emerged in Wuhan, China. The virus spread all over the world, and infected more than 750 million people [@WHO_COVID_Dashboard]. It is reported that patients in different population shows different trend of symptoms. For example, females are less likely to infect SARS-CoV-2 [@10.1371/journal.ppat.1005374]. However, mechanisms behind such a difference is still unknown.\
+[@10.1371/journal.pbio.3000849] examined gene expression in response to SARS-CoV-2 infection with shotgun RNA Sequencing to see the gene expression changes. Test condition is 430 SARS-CoV-2 patients and control condition is 54 non-infected individuals.<a name="q1"><sup>Q1</sup></a>\
+This dataset fits my interest. I lost my father last year due to COVID19, but almost nothing happened to my mother, who also infected, while both were mostly healthy and fully vaccinated. I would like to know a potential difference between my father and my mother, which is about what of my father led him dead.<a name="q2"><sup>Q2</sup></a>
+
+# Setup
+```{r message=FALSE, warning=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+if (!requireNamespace("GEOquery", quietly = TRUE))
+  install.packages("GEOquery")
+if (!requireNamespace("GEOmetadb", quietly = TRUE))
+  BiocManager::install("GEOmetadb")
+if (!requireNamespace("biomaRt", quietly = TRUE))
+    BiocManager::install("biomaRt")
+if (!requireNamespace("edgeR", quietly = TRUE)) 
+  BiocManager::install("edgeR")
+if (!requireNamespace("knitr", quietly = TRUE))
+  BiocManager::install("knitr")
+```
+
+# Data Selection
+The criterion for a dataset:\
+1. taken from native, healthy human cells or tisssue\
+2. interesting\
+3. the coverage is as complete as possible\
+4. from high-quality experiment\
+[@BCB420_Assignment1]
+
+Based on the criteria above, a dataset GSE152075 is chosen. Refer to the detail in [my journal](https://github.com/bcb420-2023/Shuzo_Fukunaga/wiki/1.1-Assignment-1---Data-set-selection-and-initial-Processing).\
+Details about the platform is shown below.
+
+Platform Title: `r gse <- GEOquery::getGEO("GSE152075", GSEMatrix = FALSE);
+                   gpl <- names(GEOquery::GPLList(gse))[1];
+                   gpl_info <- GEOquery::Meta(GEOquery::getGEO(gpl));
+                   gpl_info$title`\
+Submission Data: `r gpl_info$submission_date`\
+Last Update Data: `r gpl_info$last_update_date`\
+Organisms: `r gpl_info$organism`\
+Number of GEO Datasets: `r length(gpl_info$series_id)`\
+Number of GEO Samples: `r length(gpl_info$sample_id)`
+
+# Data Cleaning
+## Download The Data
+```{R message=FALSE, warning=FALSE}
+# Download supplemental file.
+suppFiles <- GEOquery::getGEOSuppFiles("GSE152075")
+fileNames <- rownames(suppFiles)
+# There is only one supplimental file.
+# Convert into DataFrame.
+covid_exp <- read.delim(fileNames[1], header=TRUE, check.names = FALSE, sep=" ")
+```
+
+## Assess
+```{R message=FALSE, warning=FALSE}
+# Shows a part of the dataset as a sample.
+# The beginning of the dataset.
+knitr::kable(covid_exp[1:15,1:5], format = "html")
+# The end of the test samples and the beginning of the controls.
+knitr::kable(covid_exp[1:15, 428:432], format = "html")
+# The end of the controls.
+knitr::kable(covid_exp[1:15, 480:484], format = "html")
+```
+The leftmost column shows genes and the others represents each samples. POS means a sample from SARS-CoV-2 Positive patients, while NEG means a sample from control. Note that samples range from POS_001 to POS_438 and NEG_001 to NEG_065, while there are 430 testing samples and 54 control samples. This is because some samples are omitted e.g.NEG_061. Note that further details about patients are not submitted by the author for a privacy reason.
+
+```{R message=FALSE, warning=FALSE}
+# The number of genes.
+dim(covid_exp)
+# Make sure the number of testing/control samples are not wrong.
+length(grep("POS", colnames(covid_exp)))
+length(grep("NEG", colnames(covid_exp)))
+```
+There are `r dim(covid_exp)[1]` genes in this dataset, and `r length(grep("POS", colnames(covid_exp)))` samples from SARS-CoV-2 patients i.e. testing samples and `r length(grep("NEG", colnames(covid_exp)))` samples from controls as documented in the article.
+
+```{R message=FALSE, warning=FALSE}
+# The number of duplicated genes.
+sum(duplicated(rownames(covid_exp)))
+```
+There is no duplicated genes.<a name="q3"><sup>Q3</sup></a><a name="q6"><sup>Q6</sup></a>
+
+## Map
+To list non-HUGO gene symbols, serach for an appropriate attribute.
+```{R message=FALSE, warning=FALSE}
+# Look for an appropriate attribute for HGNC symbols.
+ensembl <- biomaRt::useMart(biomart="ensembl", dataset="hsapiens_gene_ensembl")
+biomaRt::searchAttributes(mart = ensembl, "hgnc")
+```
+`hgnc_symbol` will be used.
+```{R message=FALSE, warning=FALSE}
+# Load the saved result if exists, because it can be computationally expensive.
+filename <- "covid_exp_hgnc.rds"
+if (file.exists(filename)) {
+  hgnc <- readRDS(filename)
+# Save the result.
+} else {
+# HUGO gene symbols listed.
+  hgnc <- biomaRt::getBM(attributes = "hgnc_symbol",
+                         filters = "hgnc_symbol",
+                         values = rownames(covid_exp),
+                         mart = ensembl)
+  saveRDS(hgnc, filename)
+}
+non_hugo <- rownames(covid_exp)[!(rownames(covid_exp) %in% hgnc$hgnc_symbol)]
+head(non_hugo)
+```
+These non-HUGO gene symbols are GenBank accession numbers.\
+GenBank accession numbers can be referred by an attribute named "protein_id" in Bio.[@Biostar] Note that GenBank accession numbers are called INSDC numbers in HGNC documentation.[@HGNC]
+```{R message=FALSE, warning=FALSE}
+# Look for an appropriate attribute for INSDC.
+# searchAttributes(mart = ensembl, "genbank")
+# The code above does not work.
+# An attribute named "protein_id" is used for GenBank accession numbers.
+biomaRt::searchAttributes(mart = ensembl, "protein_id")
+# Make sure non-HUGO gene symbols are GenBank accession numbers.
+filename <- "covid_exp_genbank.rds"
+if (file.exists(filename)) {
+  genBank <- readRDS(filename)
+# Save the result.
+} else {
+# HUGO gene symbols listed.
+  genBank <- biomaRt::getBM(attributes = "protein_id",
+                            values = rownames(covid_exp),
+                            mart = ensembl)
+  saveRDS(genBank, filename)
+}
+# Numbers after a period, which refers to a version, is omitted from GenBank accession numbers, because any version is included in genBank$protein_id.
+non_hugo_mod <- gsub("\\..*", "", non_hugo)
+non_hugo_genbank <- non_hugo[!(non_hugo %in% genBank$protein_id)]
+# The number of mathced genes.
+sum(!(non_hugo == non_hugo_genbank))
+```
+It was unable to convert GenBank accession numbers  into HUGO gene symbols.<a name="q4"><sup>Q4</sup></a> This is likely because those with GenBank accession numbers are not genes. For example, ABBA01000935.1 is a sequence obtained by whole genome shotgun sequence[@ABBA01000935.1]. These non-gene sequences will be removed in [clean section](#clean_non_gene)
+
+## Clean
+### Filter Low Counts Out
+```{R message=FALSE, warning=FALSE}
+# Count counts per million.
+cpms <- edgeR::cpm(covid_exp)
+# Following edgeR criteria, remove features without at least 1 read per million in the number of smallest samples.
+# The control samples are the smallest in size, which is 54.
+keep <- rowSums(cpms > 1) >= 54
+covid_exp_no_lowcounts <- covid_exp[keep,]
+dim(covid_exp_no_lowcounts)
+```
+Thus, `r dim(covid_exp)[1] - dim(covid_exp_no_lowcounts)[1]` samples are removed for low counts. Note that this does not affect the duplicates, as there is no duplicates first of all.
+
+### Remove Those with GenBank Accession Numbers 
+<a name="clean_non_gene"></a>
+```{R message=FALSE, warning=FALSE}
+covid_exp_no_lowcounts_no_accession_num <- covid_exp_no_lowcounts[(rownames(covid_exp_no_lowcounts) %in% hgnc$hgnc_symbol),]
+```
+`r dim(covid_exp_no_lowcounts)[1] - dim(covid_exp_no_lowcounts_no_accession_num)[1]` samples with GenBank Accession numbers are removed.
+
+### Remove outliers
+```{R message=FALSE, warning=FALSE}
+covid_exp_pos1_neg1 <- cbind(covid_exp_no_lowcounts_no_accession_num[,1], 
+                             covid_exp_no_lowcounts_no_accession_num[, 431])
+colnames(covid_exp_pos1_neg1) <- c(colnames(covid_exp_no_lowcounts_no_accession_num[1]),
+                                   colnames(covid_exp_no_lowcounts_no_accession_num[431]))
+data2plot <- log2(edgeR::cpm(covid_exp_pos1_neg1))
+summary(data2plot)
+boxplot(data2plot, 
+        xlab = "Samples", 
+        ylab = "CPM (log2)",
+        las = 2, 
+        cex = 0.5, 
+        cex.lab = 0.5,
+        cex.axis = 0.5,
+        ylim = c(-10, 20),
+        main = "SARS-CoV-2 RNASeq Samples")
+```
+Because there are too many samples, first samples from SARS-CoV-2 positive and negative patients are shown in boxplot here. There is no well-founded reason to remove outliers at this point. Note that there are a lot of genes without any esxpression, so the mean of cpm is nagative infinity in some samples. At total, `r dim(covid_exp)[1] - dim(covid_exp_no_lowcounts_no_accession_num)[1]` samples are removed.<a name="q5"><sup>Q5</sup></a> The final dataset has `dim(covid_exp_no_lowcounts_no_accession_num)[1]` samples.<a name="q7"><sup>Q7</sup></a>
+
+# Normalization
+## TMM Normalization
+Create SARS-CoV-2 positive/negative groups.
+```{R message=FALSE, warning=FALSE}
+samples <- data.frame(lapply(colnames(covid_exp_no_lowcounts_no_accession_num), 
+                             FUN=function(x){unlist(strsplit(x, split = "_"))[c(2,1)]}))
+colnames(samples) <- colnames(covid_exp_no_lowcounts_no_accession_num)
+rownames(samples) <- c("individual","SARS-CoV-2")
+samples <- data.frame(t(samples))
+# Save as .txt file for future assignments.
+write.table(samples, file.path(getwd(), "samples.txt"))
+```
+Create DGEList object.
+```{R message=FALSE, warning=FALSE}
+filtered_data_matrix <- as.matrix(covid_exp_no_lowcounts_no_accession_num)
+rownames(filtered_data_matrix) <- rownames(covid_exp_no_lowcounts_no_accession_num)
+d <- edgeR::DGEList(counts=filtered_data_matrix, group=samples$cell_type)
+```
+
+Normalize with Trimmed mean of M-values (TMM)
+```{R message=FALSE, warning=FALSE}
+d <- edgeR::calcNormFactors(d)
+normalized_counts <- edgeR::cpm(d)
+# Save as .txt file for future assignments.
+write.table(normalized_counts, file.path(getwd(), "normalized_counts.txt"))
+```
+
+## MDS Plot
+```{R message=FALSE, warning=FALSE}
+limma::plotMDS(d, 
+               labels=rownames(samples), 
+               col = c("darkgreen","blue")[factor(samples$SARS.CoV.2)])
+```
+
+SARS-CoV-2 positive samples are in blue, and negative samples are in green. They are well-separated, which indicates a good quality of the dataset.
+
+## Density Plot
+A density plot before normalization.
+```{R message=FALSE, warning=FALSE}
+counts_density <- apply(log2(edgeR::cpm(covid_exp_no_lowcounts_no_accession_num)), 2, density)
+xlim <- 0
+ylim <- 0
+for (i in 1:length(counts_density)) {
+  xlim <- range(c(xlim, counts_density[[i]]$x))
+  ylim <- range(c(ylim, counts_density[[i]]$y))
+  }
+cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+
+#plot the first density plot to initialize the plot
+plot(counts_density[[1]], 
+     xlim=xlim, 
+     ylim=ylim, 
+     type="n",
+     ylab="Density Plot Before Normalization",
+     main="", 
+     cex.lab = 0.85)
+
+#plot each line
+for (i in 1:length(counts_density)) {
+  lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+  }
+#create legend
+legend("topright", 
+       colnames(covid_exp_no_lowcounts_no_accession_num),
+       col=cols, 
+       lty=ltys, 
+       cex=0.2,
+       border ="blue", 
+       text.col = "green4",
+       merge = TRUE, 
+       bg = "gray90",
+       ncol=10)
+```
+
+A density plot after normalization.
+```{R message=FALSE, warning=FALSE}
+counts_density <- apply(log2(edgeR::cpm(normalized_counts)), 2, density)
+xlim <- 0
+ylim <- 0
+for (i in 1:length(counts_density)) {
+  xlim <- range(c(xlim, counts_density[[i]]$x))
+  ylim <- range(c(ylim, counts_density[[i]]$y))
+  }
+cols <- rainbow(length(counts_density))
+ltys <- rep(1, length(counts_density))
+
+#plot the first density plot to initialize the plot
+plot(counts_density[[1]], 
+     xlim=xlim, 
+     ylim=ylim, 
+     type="n",
+     ylab="Density Plot After Normalization",
+     main="", 
+     cex.lab = 0.85)
+
+#plot each line
+for (i in 1:length(counts_density)) {
+  lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+  }
+#create legend
+legend("topright", 
+       colnames(normalized_counts),
+       col=cols, 
+       lty=ltys, 
+       cex=0.2,
+       border ="blue", 
+       text.col = "green4",
+       merge = TRUE, 
+       bg = "gray90",
+       ncol=10)
+```
+
+## Dispersion
+```{R message=FALSE, warning=FALSE}
+model_design <- model.matrix(~samples$individual + samples$SARS.CoV.2 + 0)
+d <- edgeR::estimateDisp(d, model_design)
+edgeR::plotBCV(d, col.tagwise = "black",col.common = "red",)
+```
+This graph indicates that the variance of this data is consistent, as genes with low counts tend to have higher variations.
+
+# Main Questions for Report
+[What are the control and test conditions of the dataset?](#q1)\
+[Why is the dataset of interest to you?](#q2)\
+[Were there expression values that were not unique for specific genes? How did you handle these?](#q3)\
+[Were there expression values that could not be mapped to current HUGO symbols?](#q4)\
+[How many outliers were removed?](#q5)\
+[How did you handle replicates?](#q6)\
+[What is the final coverage of your dataset?](#q7)
+
+# Reference
